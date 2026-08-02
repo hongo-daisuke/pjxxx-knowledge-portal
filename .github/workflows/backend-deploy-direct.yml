@@ -1,0 +1,107 @@
+name: Backend Deploy (Direct Login)
+
+# ============================================================
+# バックエンド デプロイ (直接ログイン構成)
+#
+# 構成:
+#   GitHub Actions → 直接 環境アカウントの IAM Role を AssumeRole (1 段)
+#
+# 用途:
+#   sandbox / 個人検証等の独立アカウント環境向け。
+#   踏み台アカウントを経由しない直接アクセス構成。
+#
+# パターン 1 (踏み台 + スイッチロール) を採用するプロジェクトは
+#   backend-deploy-bastion.yml を使用してください。
+#
+# 必要な事前設定:
+#   - GitHub Environments: dev / prd を作成
+#   - 各 environment の Secrets: AWS_ROLE_ARN
+#   - 各 environment の Variables: AWS_REGION
+#   - AWS 側: 各環境アカウントに OIDC + IAM Role 設定
+#
+# 詳細: docs/github-environments-setup.md / docs/aws-iam-role-setup.md 参照
+# ============================================================
+
+on:
+  push:
+    branches:
+      - main             # 本番用メインブランチ → prd 環境
+      - dev              # 開発統合ブランチ     → dev 環境
+      # 個人作業ブランチを dev 環境へ自動デプロイしたい場合は下記を有効化する (任意)。
+      # デフォルトは CLAUDE.md のブランチ戦略 (個人ブランチはデプロイなし) に合わせて無効。
+      # 例: 'work/**' は work/login のようなブランチを dev にデプロイする。
+      # - 'work/**'
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # ブランチ名から environment を動的に決定
+    environment: ${{ github.ref_name == 'main' && 'prd' || 'dev' }}
+
+    # モノレポ: backend/ 配下で各コマンドを実行
+    defaults:
+      run:
+        working-directory: backend
+
+    concurrency:
+      group: backend-deploy-direct-${{ github.ref }}
+      cancel-in-progress: true
+
+    permissions:
+      id-token: write
+      contents: read
+
+    if: ${{ !contains(github.event.head_commit.message, '[skip-deploy]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Deploy info
+        run: |
+          echo "Branch:  ${{ github.ref_name }}"
+          echo "Commit:  ${{ github.sha }}"
+          echo "Actor:   ${{ github.actor }}"
+          echo "Env:     ${{ github.ref_name == 'main' && 'prd' || 'dev' }}"
+          echo "Message: ${{ github.event.head_commit.message }}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: 'backend/.python-version'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements*.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # AWS 認証 (OIDC、1 段 AssumeRole)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: SAM validate
+        run: sam validate --lint
+
+      - name: SAM build
+        run: sam build
+
+      - name: SAM deploy
+        # samconfig.toml の対応する [<env>] セクションを使用
+        # --no-confirm-changeset で対話プロンプトをスキップ (CI 環境のため)
+        run: |
+          ENV_NAME="${{ github.ref_name == 'main' && 'prd' || 'dev' }}"
+          sam deploy --config-env "$ENV_NAME" --no-confirm-changeset --no-fail-on-empty-changeset

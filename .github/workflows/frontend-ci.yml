@@ -1,0 +1,233 @@
+name: Frontend CI
+
+# ============================================================
+# フロントエンド CI
+#
+# 役割:
+#   PR 作成・更新時に以下を実行:
+#     1. Lint (ESLint + Oxlint)
+#     2. Format check (Prettier)
+#     3. Type check (vue-tsc)
+#     4. 単体テスト (Vitest)
+#     5. ビルド (vite build)
+#     6. E2E テスト (Playwright)
+#
+# ジョブ構成 (paths-filter + ダミー成功 job 方式 + E2E ラベル制御):
+#   1. changes      … paths-filter でフロントエンド変更を検知 (常に実行)
+#   2. ci           … Lint / Format / Type-check / Test / Build (変更時のみ実行)
+#   3. e2e          … Playwright E2E (変更時 + skip-e2e ラベルなし時のみ実行)
+#   4. ci-required  … Branch Protection 用ダミー成功ジョブ (常に実行)
+#
+# Branch Protection Rules で必須にするジョブ名:
+#   - "Frontend CI Required"
+#
+# 緊急マージ:
+#   PR に "skip-e2e" ラベルを付与すると E2E がスキップされる
+#   (E2E は時間がかかるため、緊急マージ時の選択肢として用意)
+#
+# 詳細: docs/github-actions-guide.md 参照
+# ============================================================
+
+on:
+  pull_request:
+    # paths は使わない (Branch Protection との相性問題を回避)
+
+  workflow_dispatch:
+
+jobs:
+  # ----------------------------------------------------------
+  # 1. 変更検知ジョブ
+  # ----------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Detect frontend changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/frontend-ci.yml'
+
+  # ----------------------------------------------------------
+  # 2. CI 本体ジョブ (フロントエンド変更時のみ実行)
+  # ----------------------------------------------------------
+  ci:
+    name: Lint / Format / Type-check / Test / Build
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # モノレポ: frontend/ 配下で各コマンドを実行
+    defaults:
+      run:
+        working-directory: frontend
+
+    concurrency:
+      group: frontend-ci-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'frontend/.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 規約: Lint → Format → Type-check → Test → Build の順で 1 つでも失敗したら後続停止
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Unit test (Vitest)
+        run: npm run test:unit
+
+      - name: Build
+        run: npm run build
+
+  # ----------------------------------------------------------
+  # 3. E2E テストジョブ
+  #
+  # 実行条件:
+  #   - frontend に変更がある
+  #   - PR に "skip-e2e" ラベルが付いていない
+  #   - ci ジョブが成功している
+  # ----------------------------------------------------------
+  e2e:
+    name: E2E (Playwright)
+    needs: [changes, ci]
+    if: |
+      needs.changes.outputs.frontend == 'true' &&
+      needs.ci.result == 'success' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # モノレポ: frontend/ 配下で各コマンドを実行
+    defaults:
+      run:
+        working-directory: frontend
+
+    concurrency:
+      group: frontend-e2e-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'frontend/.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 14
+
+  # ----------------------------------------------------------
+  # 4. ダミー成功ジョブ (Branch Protection 用)
+  #
+  # このジョブを Branch Protection Rules の Required status checks に
+  # 指定する。常に実行され、前段の結果に応じて成功/失敗を返す。
+  # ----------------------------------------------------------
+  ci-required:
+    name: Frontend CI Required
+    needs: [changes, ci, e2e]
+    if: always()  # 前段ジョブの成功失敗に関わらず必ず実行
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check CI result
+        run: |
+          # changes ジョブが失敗していたら fail
+          if [ "${{ needs.changes.result }}" = "failure" ]; then
+            echo "❌ changes ジョブが失敗しました"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.result }}" = "cancelled" ]; then
+            echo "❌ changes ジョブがキャンセルされました"
+            exit 1
+          fi
+
+          # フロントエンドに変更がない場合は ci/e2e がスキップされるので OK
+          if [ "${{ needs.changes.outputs.frontend }}" = "false" ]; then
+            echo "✅ Frontend に変更なし、CI/E2E スキップ (問題なし)"
+            exit 0
+          fi
+
+          # フロントエンドに変更がある場合、ci の結果を見る
+          if [ "${{ needs.ci.result }}" = "failure" ]; then
+            echo "❌ CI ジョブが失敗しました"
+            exit 1
+          fi
+
+          if [ "${{ needs.ci.result }}" = "cancelled" ]; then
+            echo "❌ CI ジョブがキャンセルされました"
+            exit 1
+          fi
+
+          # ci 成功時、e2e の状態を確認
+          # e2e が skipped (= skip-e2e ラベル付与) なら OK
+          if [ "${{ needs.e2e.result }}" = "skipped" ]; then
+            echo "✅ CI 成功 + E2E は skip-e2e ラベルでスキップ"
+            exit 0
+          fi
+
+          # e2e が失敗していたら fail
+          if [ "${{ needs.e2e.result }}" = "failure" ]; then
+            echo "❌ E2E ジョブが失敗しました"
+            exit 1
+          fi
+
+          if [ "${{ needs.e2e.result }}" = "cancelled" ]; then
+            echo "❌ E2E ジョブがキャンセルされました"
+            exit 1
+          fi
+
+          # 全部成功
+          if [ "${{ needs.ci.result }}" = "success" ] && [ "${{ needs.e2e.result }}" = "success" ]; then
+            echo "✅ Frontend CI + E2E 全部成功"
+            exit 0
+          fi
+
+          # 想定外のケース
+          echo "⚠️ 想定外の状態: ci=${{ needs.ci.result }}, e2e=${{ needs.e2e.result }}"
+          exit 1

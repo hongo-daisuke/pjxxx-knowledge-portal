@@ -1,0 +1,142 @@
+name: Frontend Deploy (Bastion + Switch Role)
+
+# ============================================================
+# フロントエンド デプロイ (踏み台 + スイッチロール構成)
+#
+# 構成:
+#   GitHub Actions
+#     → 踏み台アカウントの IAM Role を AssumeRole (Step 1, OIDC)
+#     → 環境アカウントの IAM Role に Role Chaining   (Step 2)
+#
+# 用途:
+#   本プロジェクト (pjxxx-template-system) のような、
+#   踏み台アカウント経由で各環境にスイッチロールする構成向け。
+#
+# 直接ログイン構成 (sandbox 等) を使うプロジェクトは
+#   frontend-deploy-direct.yml を使用してください。
+#
+# 必要な事前設定:
+#   - GitHub Environments: dev / prd を作成
+#   - 各 environment の Secrets: AWS_BASTION_ROLE_ARN / AWS_ROLE_ARN / ENV_FILE
+#   - 各 environment の Variables: AWS_REGION / S3_BUCKET_NAME
+#   - AWS 側: 踏み台アカウントに OIDC + IAM Role / 各環境アカウントに Trust Policy
+#
+# 詳細: docs/github-environments-setup.md / docs/aws-iam-role-setup.md 参照
+# ============================================================
+
+on:
+  push:
+    branches:
+      - main             # 本番用メインブランチ → prd 環境
+      - dev              # 開発統合ブランチ     → dev 環境
+      # 個人作業ブランチを dev 環境へ自動デプロイしたい場合は下記を有効化する (任意)。
+      # デフォルトは CLAUDE.md のブランチ戦略 (個人ブランチはデプロイなし) に合わせて無効。
+      # 例: 'work/**' は work/login のようなブランチを dev にデプロイする。
+      # - 'work/**'
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    environment: ${{ github.ref_name == 'main' && 'prd' || 'dev' }}
+
+    concurrency:
+      group: frontend-deploy-bastion-${{ github.ref }}
+      cancel-in-progress: true
+
+    permissions:
+      id-token: write
+      contents: read
+
+    if: ${{ !contains(github.event.head_commit.message, '[skip-deploy]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Deploy info
+        run: |
+          echo "Branch:  ${{ github.ref_name }}"
+          echo "Commit:  ${{ github.sha }}"
+          echo "Actor:   ${{ github.actor }}"
+          echo "Env:     ${{ github.ref_name == 'main' && 'prd' || 'dev' }}"
+          echo "Message: ${{ github.event.head_commit.message }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: 'frontend/.nvmrc'
+          cache-dependency-path: 'frontend/package-lock.json'
+          cache: 'npm'
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Create .env file
+        working-directory: frontend
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: printf '%s' "$ENV_FILE" > .env
+
+      - name: Build
+        working-directory: frontend
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            npm run build:prd
+          else
+            npm run build:dev
+          fi
+
+      # ========================================================
+      # AWS 認証 (Step 1: 踏み台 Role を AssumeRole / OIDC)
+      # ========================================================
+      - name: Configure AWS credentials (Bastion)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BASTION_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ========================================================
+      # AWS 認証 (Step 2: 環境 Role に Role Chaining)
+      # ========================================================
+      - name: Configure AWS credentials (Environment)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-chaining: true        # 既存の認証情報を使って次の Role を Assume する
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Sync to S3 with backup
+        # バックアップロジック (詳細は frontend-deploy-direct.yml と同じ):
+        #   ケース 1: /bk が存在 → /bk を空にして /app を /bk へコピー
+        #   ケース 2: /bk なし & /app なし (初回デプロイ) → スキップ
+        #   ケース 3: /bk なし & /app あり → /bk を作成して /app をコピー
+        # 最後に dist/ を /app に同期 (/bk は同期先 app/ プレフィックスの外にあるため影響を受けない)
+        run: |
+          BUCKET="s3://${{ vars.S3_BUCKET_NAME }}"
+          APP_PREFIX="app"
+          BK_PREFIX="bk"
+
+          APP_FILES=$(aws s3 ls "${BUCKET}/${APP_PREFIX}/" --recursive 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+          BK_FILES=$(aws s3 ls "${BUCKET}/${BK_PREFIX}/" --recursive 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+
+          echo "/app ファイル数: ${APP_FILES}"
+          echo "/bk  ファイル数: ${BK_FILES}"
+
+          if [ "${BK_FILES}" -gt 0 ]; then
+            echo "[ケース1] /bk が存在するため、/bk を削除後に /app を /bk へコピーします。"
+            aws s3 rm "${BUCKET}/${BK_PREFIX}/" --recursive
+            aws s3 sync "${BUCKET}/${APP_PREFIX}/" "${BUCKET}/${BK_PREFIX}/"
+          elif [ "${APP_FILES}" -eq 0 ]; then
+            echo "[ケース2] 初回デプロイのため、バックアップ処理をスキップします。"
+          else
+            echo "[ケース3] /bk が存在しないため、作成して /app を /bk へコピーします。"
+            aws s3 sync "${BUCKET}/${APP_PREFIX}/" "${BUCKET}/${BK_PREFIX}/"
+          fi
+
+          echo "dist/ を ${BUCKET}/${APP_PREFIX}/ へ同期します。"
+          aws s3 sync frontend/dist/ "${BUCKET}/${APP_PREFIX}/" --delete

@@ -1,0 +1,165 @@
+name: Backend CI
+
+# ============================================================
+# バックエンド CI
+#
+# 役割:
+#   PR 作成・更新時に以下を実行:
+#     1. Lint (ruff check)
+#     2. Format check (ruff format --check)
+#     3. Type check (mypy --strict)
+#     4. 単体テスト (pytest)
+#     5. SAM テンプレート検証 (sam validate --lint)
+#     6. ビルド (sam build)
+#
+# ジョブ構成 (paths-filter + ダミー成功 job 方式):
+#   1. changes      … paths-filter でバックエンド変更を検知 (常に実行)
+#   2. ci           … Lint / Format / Type-check / Test / SAM (変更時のみ実行)
+#   3. ci-required  … Branch Protection 用ダミー成功ジョブ (常に実行)
+#
+# Branch Protection Rules で必須にするジョブ名:
+#   - "Backend CI Required"
+#
+# 詳細: docs/github-actions-guide.md 参照
+# ============================================================
+
+on:
+  pull_request:
+    # paths は使わない (Branch Protection との相性問題を回避)
+
+  workflow_dispatch:
+
+jobs:
+  # ----------------------------------------------------------
+  # 1. 変更検知ジョブ
+  # ----------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Detect backend changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - '.github/workflows/backend-ci.yml'
+
+  # ----------------------------------------------------------
+  # 2. CI 本体ジョブ (バックエンド変更時のみ実行)
+  # ----------------------------------------------------------
+  ci:
+    name: Lint / Format / Type-check / Test / SAM validate / SAM build
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # モノレポ: backend/ 配下で各コマンドを実行
+    defaults:
+      run:
+        working-directory: backend
+
+    concurrency:
+      group: backend-ci-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: 'backend/.python-version'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements*.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # 規約: Lint → Format → Type-check → Test → SAM validate → SAM build の順
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      - name: Type check (mypy)
+        run: mypy --strict .
+
+      - name: Unit test (pytest)
+        run: pytest
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: SAM validate (with lint)
+        run: sam validate --lint
+
+      - name: SAM build
+        run: sam build
+
+  # ----------------------------------------------------------
+  # 3. ダミー成功ジョブ (Branch Protection 用)
+  #
+  # このジョブを Branch Protection Rules の Required status checks に
+  # 指定する。常に実行され、前段の結果に応じて成功/失敗を返す。
+  # ----------------------------------------------------------
+  ci-required:
+    name: Backend CI Required
+    needs: [changes, ci]
+    if: always()  # 前段ジョブの成功失敗に関わらず必ず実行
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check CI result
+        run: |
+          # changes ジョブが失敗していたら fail
+          if [ "${{ needs.changes.result }}" = "failure" ]; then
+            echo "❌ changes ジョブが失敗しました"
+            exit 1
+          fi
+
+          # changes ジョブがキャンセルされていたら fail
+          if [ "${{ needs.changes.result }}" = "cancelled" ]; then
+            echo "❌ changes ジョブがキャンセルされました"
+            exit 1
+          fi
+
+          # バックエンドに変更がない場合は ci がスキップされるので OK
+          if [ "${{ needs.changes.outputs.backend }}" = "false" ]; then
+            echo "✅ Backend に変更なし、CI スキップ (問題なし)"
+            exit 0
+          fi
+
+          # バックエンドに変更がある場合、ci の結果を見る
+          if [ "${{ needs.ci.result }}" = "failure" ]; then
+            echo "❌ CI ジョブが失敗しました"
+            exit 1
+          fi
+
+          if [ "${{ needs.ci.result }}" = "cancelled" ]; then
+            echo "❌ CI ジョブがキャンセルされました"
+            exit 1
+          fi
+
+          if [ "${{ needs.ci.result }}" = "success" ]; then
+            echo "✅ Backend CI 全部成功"
+            exit 0
+          fi
+
+          # 想定外のケース
+          echo "⚠️ 想定外の状態: ci result = ${{ needs.ci.result }}"
+          exit 1

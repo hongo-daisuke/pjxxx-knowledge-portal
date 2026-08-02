@@ -1,0 +1,118 @@
+name: Backend Deploy (Bastion + Switch Role)
+
+# ============================================================
+# バックエンド デプロイ (踏み台 + スイッチロール構成)
+#
+# 構成:
+#   GitHub Actions
+#     → 踏み台アカウントの IAM Role を AssumeRole (Step 1, OIDC)
+#     → 環境アカウントの IAM Role に Role Chaining   (Step 2)
+#
+# 用途:
+#   本プロジェクト (pjxxx-template-system) のような、
+#   踏み台アカウント経由で各環境にスイッチロールする構成向け。
+#
+# 直接ログイン構成 (sandbox 等) を使うプロジェクトは
+#   backend-deploy-direct.yml を使用してください。
+#
+# 必要な事前設定:
+#   - GitHub Environments: dev / prd を作成
+#   - 各 environment の Secrets: AWS_BASTION_ROLE_ARN / AWS_ROLE_ARN
+#   - 各 environment の Variables: AWS_REGION
+#   - AWS 側: 踏み台アカウントに OIDC + IAM Role / 各環境アカウントに Trust Policy
+#
+# 詳細: docs/github-environments-setup.md / docs/aws-iam-role-setup.md 参照
+# ============================================================
+
+on:
+  push:
+    branches:
+      - main             # 本番用メインブランチ → prd 環境
+      - dev              # 開発統合ブランチ     → dev 環境
+      # 個人作業ブランチを dev 環境へ自動デプロイしたい場合は下記を有効化する (任意)。
+      # デフォルトは CLAUDE.md のブランチ戦略 (個人ブランチはデプロイなし) に合わせて無効。
+      # 例: 'work/**' は work/login のようなブランチを dev にデプロイする。
+      # - 'work/**'
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    environment: ${{ github.ref_name == 'main' && 'prd' || 'dev' }}
+
+    # モノレポ: backend/ 配下で各コマンドを実行
+    defaults:
+      run:
+        working-directory: backend
+
+    concurrency:
+      group: backend-deploy-bastion-${{ github.ref }}
+      cancel-in-progress: true
+
+    permissions:
+      id-token: write
+      contents: read
+
+    if: ${{ !contains(github.event.head_commit.message, '[skip-deploy]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Deploy info
+        run: |
+          echo "Branch:  ${{ github.ref_name }}"
+          echo "Commit:  ${{ github.sha }}"
+          echo "Actor:   ${{ github.actor }}"
+          echo "Env:     ${{ github.ref_name == 'main' && 'prd' || 'dev' }}"
+          echo "Message: ${{ github.event.head_commit.message }}"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: 'backend/.python-version'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements*.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # ========================================================
+      # AWS 認証 (Step 1: 踏み台 Role を AssumeRole / OIDC)
+      # ========================================================
+      - name: Configure AWS credentials (Bastion)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BASTION_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # ========================================================
+      # AWS 認証 (Step 2: 環境 Role に Role Chaining)
+      # ========================================================
+      - name: Configure AWS credentials (Environment)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-chaining: true
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: SAM validate
+        run: sam validate --lint
+
+      - name: SAM build
+        run: sam build
+
+      - name: SAM deploy
+        run: |
+          ENV_NAME="${{ github.ref_name == 'main' && 'prd' || 'dev' }}"
+          sam deploy --config-env "$ENV_NAME" --no-confirm-changeset --no-fail-on-empty-changeset

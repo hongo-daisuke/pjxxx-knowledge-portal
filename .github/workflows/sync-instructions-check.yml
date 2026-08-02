@@ -1,0 +1,44 @@
+name: AI Instructions Sync Check
+
+# ============================================================
+# 規約ファイル同期チェック
+#
+# 役割:
+#   .claude/rules/ と .github/instructions/ の規約ファイルが
+#   同期されているかを CI で検証する。
+#
+#   Claude Code 用と GitHub Copilot 用の規約ファイルが
+#   二重メンテで差分が出ることを防ぐ。
+#
+# 同期スクリプト:
+#   ./scripts/sync-ai-instructions.sh
+#
+# ローカルでの解消方法:
+#   差分があれば ./scripts/sync-ai-instructions.sh を実行して
+#   コミットすれば解消する。
+# ============================================================
+
+on:
+  pull_request:
+    paths:
+      - '.claude/rules/**'
+      - '.github/instructions/**'
+      - '.github/prompts/**'
+      - 'CLAUDE.md'
+      - '.github/copilot-instructions.md'
+      - 'scripts/sync-ai-instructions.sh'
+
+jobs:
+  sync-check:
+    name: Check AI instructions sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Make sync script executable
+        run: chmod +x ./scripts/sync-ai-instructions.sh
+
+      - name: Run sync check
+        run: ./scripts/sync-ai-instructions.sh --check

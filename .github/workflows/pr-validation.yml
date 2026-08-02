@@ -1,0 +1,100 @@
+name: PR Validation
+
+# ============================================================
+# PR バリデーション
+#
+# 役割:
+#   - 必須チェックボックスが入っているか確認 (動作確認済み等)
+#   - ブロックラベル (wip / do-not-merge 等) が付いていないか確認
+#   - カテゴリラベル (feature / bugfix 等) が 1 つ以上付いているか確認
+#
+# このジョブを Branch Protection の Required status checks に
+# 設定すると、上記の条件を満たすまで Merge ボタンが押せなくなります。
+# ============================================================
+
+on:
+  pull_request:
+    types:
+      - opened           # PR 作成時
+      - edited           # PR 本文編集時 (チェックボックス付け替え反映に必須)
+      - synchronize      # PR にコミット push 時
+      - reopened         # クローズ後再オープン時
+      - labeled          # ラベル付与時
+      - unlabeled        # ラベル削除時
+
+jobs:
+  # ----------------------------------------------------------
+  # 必須チェックボックスのバリデーション
+  # ----------------------------------------------------------
+  required-checkboxes:
+    name: Required checkboxes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate required checkboxes
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          MISSING=()
+
+          # 必須チェック項目を 1 つずつ確認
+          if ! echo "$PR_BODY" | grep -qE "^\s*-\s*\[[xX]\]\s*\*\*動作確認済み"; then
+            MISSING+=("動作確認済み")
+          fi
+          if ! echo "$PR_BODY" | grep -qE "^\s*-\s*\[[xX]\]\s*\*\*既存規約に従っている"; then
+            MISSING+=("既存規約に従っている")
+          fi
+          if ! echo "$PR_BODY" | grep -qE "^\s*-\s*\[[xX]\]\s*\*\*AI コーディングエージェントによるコードレビュー実施済み"; then
+            MISSING+=("AI コーディングエージェントによるコードレビュー実施済み")
+          fi
+
+          if [ ${#MISSING[@]} -ne 0 ]; then
+            echo "::error::以下の必須チェック項目が未完了です:"
+            for item in "${MISSING[@]}"; do
+              echo "::error::  - $item"
+            done
+            echo ""
+            echo "PR 本文の「自己宣言 (必須)」セクションでチェックしてください。"
+            exit 1
+          fi
+
+          echo "✅ 必須チェック項目すべて OK"
+
+  # ----------------------------------------------------------
+  # ラベル要件のバリデーション
+  # ----------------------------------------------------------
+  label-validation:
+    name: Label validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate labels
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+
+            // ① ブロックラベル (1 つでもあったら fail)
+            const blockLabels = ['wip', 'do-not-merge', 'needs-discussion'];
+            const blockedBy = labels.find(l => blockLabels.includes(l));
+            if (blockedBy) {
+              core.setFailed(
+                `このPRには「${blockedBy}」ラベルが付いているためマージできません。\n` +
+                `作業完了後、該当ラベルを外してください。`
+              );
+              return;
+            }
+
+            // ② カテゴリラベルが 1 つ以上付いているか確認
+            const categoryLabels = ['feature', 'bugfix', 'refactor', 'chore', 'docs', 'infra'];
+            const hasCategory = labels.some(l => categoryLabels.includes(l));
+            if (!hasCategory) {
+              core.setFailed(
+                `カテゴリラベルが必要です。以下のいずれかを付与してください:\n` +
+                `  ${categoryLabels.join(' / ')}\n\n` +
+                `詳細は CONTRIBUTING.md の「PR ラベル運用」セクション参照`
+              );
+              return;
+            }
+
+            console.log(`✅ ラベル OK: ${labels.join(', ')}`);

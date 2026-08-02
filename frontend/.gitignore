@@ -1,0 +1,18 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# 環境変数 (実値はリポジトリにコミットしない。ローカル開発時は .env.example からコピーして作成)
+.env
+.env.*
+!.env.example
+
+# テスト出力
+coverage/
+playwright-report/
+test-results/
+
+# キャッシュ
+.vite/
+*.tsbuildinfo
